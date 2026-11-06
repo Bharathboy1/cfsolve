@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::Local;
-use tokio::{task, time};
+use tokio::time;
 use url::Url;
 use wreq::ws::message::Message;
 
@@ -31,8 +31,8 @@ use crate::stage2::replay::{self, Replay};
 use crate::stage2::trace::Trace;
 
 /// Timeout for host reachability fetches. Browsers report these hosts as unreachable within
-/// milliseconds.
-const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+/// milliseconds, so a short deadline keeps the probe from stalling the solve.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A probe kind's duration when nothing else gives one.
 const DEFAULT_DURATION_MS: i64 = 2;
@@ -63,9 +63,16 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     observed.page_signals = Some(merged.page_signals.clone());
     let replay = answers.map(|answers| Replay::new(answers, plan));
     let planned = durations(plan, &profile.durations, &observed, replay.as_ref());
+    let probes_timer = std::time::Instant::now();
     // The stack is needed only for the records, so rebuild it while the probes run.
     let probes = run_probes(session, plan, &options, profile, &mut observed, &planned);
     let ((schedule, fetches), stack) = tokio::try_join!(probes, probe_stack(session, plan))?;
+    session.sink.progress(&format!(
+        "Completed {} probes in {}ms (schedule send in {}ms)",
+        plan.probes().len(),
+        probes_timer.elapsed().as_millis(),
+        schedule.send_at - performance_clock::epoch_ms()
+    ));
     observed.stack = stack;
     // Resource timings now include the first POST and probe requests.
     if let Some(timing) = &merged.state.timing {
@@ -267,19 +274,12 @@ async fn probe_stack(session: &WidgetSession<'_>, plan: &ProbePlan) -> Result<Op
         )
     })?;
     let fetched = &session.fetched;
-    let javascript = fetched.javascript.clone();
-    let cases = fetched.cases.clone();
     let origin = fetched.script_position()?;
-    let engine = session.client.engine();
-    let stack = task::spawn_blocking(move || {
-        let resumed = call_stack::Resumption::WorkerMessage;
-        let geometry = call_stack::recover_probe(&javascript, &cases, calls, resumed)?;
-        anyhow::Ok(geometry.format(&origin, engine))
-    })
-    .await
-    .context("the stack recovery thread failed")?
-    .with_context(|| format!("rebuilding probe {}'s stack", probe.index))?;
-    Ok(Some(stack))
+    let resumed = call_stack::Resumption::WorkerMessage;
+    let geometry = call_stack::recover_probe(&fetched.decoding, &fetched.cases, calls, resumed)
+        .await
+        .with_context(|| format!("rebuilding probe {}'s stack", probe.index))?;
+    Ok(Some(geometry.format(&origin, session.client.engine())))
 }
 
 /// Chooses probe durations from completed work, `configured` profile values, stored answers, or

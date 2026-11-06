@@ -2,6 +2,7 @@
 //! merges page parameters with iframe state.
 
 use std::mem;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use url::Url;
@@ -13,9 +14,11 @@ use crate::browser::Page;
 use crate::challenge::program::{ExtractedProgram, PreparedSession};
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::challenge::{payload, source};
+use crate::deobfuscate::Decoding;
 use crate::embedding_page::extra_params::{self, ApiScript, LoaderResponse};
 use crate::embedding_page::page::{Layout, PageSignals, RenderedPage, Widget};
 use crate::engine::{self, Lines};
+use crate::http::ResponseMetrics;
 use crate::http::{self, BrowserClient, Iframe, PageDocument, ReferrerPolicy, ScriptLoad};
 use crate::js::{JsValue, Options, Payload, Window, json};
 use crate::resource_timing::LoadTiming;
@@ -43,6 +46,8 @@ pub(crate) struct Fetched {
     pub iframe: Iframe,
     /// The iframe's inline challenge script, as served.
     pub javascript: String,
+    /// The same script decoded for stack recovery.
+    pub decoding: Decoding,
     /// The deobfuscated script, parsed once.
     pub source: Source,
     /// Original VM dispatch-case positions used for stack recovery.
@@ -228,6 +233,19 @@ pub(crate) async fn render_page(
     ))
 }
 
+/// Cached raw loader response body and metadata for browser HTTP caching emulation.
+struct CachedLoader {
+    body: Vec<u8>,
+    body_url: Url,
+    network: ResponseMetrics,
+    allowed: String,
+    fetched_at: std::time::Instant,
+}
+
+static LOADER_RESPONSE_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<rustc_hash::FxHashMap<String, CachedLoader>>,
+> = std::sync::OnceLock::new();
+
 /// Fetches the loader at `url`, timing it through the last body byte and rounding the duration
 /// as browser resource timing does. `facts` say how the browser reports it.
 pub(crate) async fn fetch_loader(
@@ -238,21 +256,70 @@ pub(crate) async fn fetch_loader(
     policy: ReferrerPolicy,
     facts: &Page,
 ) -> Result<(ApiScript, LoadTiming)> {
-    let referer = policy.referrer(page, &url);
+    let url_key = url.as_str().to_string();
+    let cache = LOADER_RESPONSE_CACHE
+        .get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
+    let cached = {
+        let guard = cache.read().ok();
+        guard.and_then(|g| {
+            if let Some(entry) = g.get(&url_key) {
+                if entry.fetched_at.elapsed() < Duration::from_secs(3600) {
+                    return Some((
+                        entry.body.clone(),
+                        entry.body_url.clone(),
+                        entry.network.clone(),
+                        entry.allowed.clone(),
+                    ));
+                }
+            }
+            None
+        })
+    };
+
     let timer = Timer::start();
-    let response = http::fetch_script(client, &url, load, page, referer.as_deref())
-        .await
-        .context("fetching the Turnstile loader script")?;
-    let body_url = Url::parse(&response.uri().to_string())?;
-    let allowed = response
-        .headers()
-        .get("timing-allow-origin")
-        .map(http::header_text)
-        .unwrap_or_default();
-    let (body, network) = http::read_encoded(response).await?;
+    let (body, body_url, network, allowed, duration_ms) =
+        if let Some((body, body_url, network, allowed)) = cached {
+            (
+                body,
+                body_url,
+                network,
+                allowed,
+                facts.timeline.script_fetch,
+            )
+        } else {
+            let referer = policy.referrer(page, &url);
+            let response = http::fetch_script(client, &url, load, page, referer.as_deref())
+                .await
+                .context("fetching the Turnstile loader script")?;
+            let body_url = Url::parse(&response.uri().to_string())?;
+            let allowed = response
+                .headers()
+                .get("timing-allow-origin")
+                .map(http::header_text)
+                .unwrap_or_default();
+            let (body, network) = http::read_encoded(response).await?;
+            if let Ok(mut guard) = cache.write() {
+                guard.insert(
+                    url_key,
+                    CachedLoader {
+                        body: body.clone(),
+                        body_url: body_url.clone(),
+                        network: network.clone(),
+                        allowed: allowed.clone(),
+                        fetched_at: std::time::Instant::now(),
+                    },
+                );
+            }
+            let dur = timer
+                .overall(url.as_str(), network.encoded_bytes)
+                .duration_ms
+                .round();
+            (body, body_url, network, allowed, dur)
+        };
+
     let source = String::from_utf8(body).context("loader script is not UTF-8")?;
     let mut timing = timer.overall(url.as_str(), network.encoded_bytes);
-    timing.duration_ms = timing.duration_ms.round();
+    timing.duration_ms = duration_ms;
     let timing_exposed = extra_params::timing_exposed(&url, page, &allowed);
     let response = LoaderResponse {
         body_url,
@@ -287,12 +354,16 @@ pub(super) async fn fetch(
         iframe.html.len(),
         javascript.len()
     ));
+    // The stack probe's frames are read from the script as decoded, which its own thread
+    // decodes meanwhile.
+    let decoding = Decoding::start(javascript.clone())?;
     let (text, cases) = deobfuscate(sink, javascript.clone()).await?;
     sink.artifact("iframe.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated iframe")?;
     Ok(Fetched {
         iframe,
         javascript,
+        decoding,
         source,
         cases,
         navigation,

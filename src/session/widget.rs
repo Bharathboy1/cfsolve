@@ -227,7 +227,9 @@ async fn start_widget<'caller>(
 fn analyze_probes(sink: &dyn Sink, source: &Source, program: &[u8]) -> Result<Analysis> {
     let analysis =
         analysis::analyze(source, program).context("analyzing the first response's program")?;
-    sink.json("stage2.json", &analysis.artifact())?;
+    if sink.wants_artifacts() {
+        sink.json("stage2.json", &analysis.artifact())?;
+    }
     let probes = analysis.plan().probes();
     let implemented = probes
         .iter()
@@ -382,7 +384,12 @@ impl WidgetSession<'_> {
 
     /// Answers probes and any requested checkbox program, through the completion token.
     async fn solve(&self, embedding_page: &EmbeddingPage, solve: &Solve) -> Result<Completion> {
+        let prep_start = std::time::Instant::now();
         let mut submission = probes::prepare(self, solve).await?;
+        self.sink.progress(&format!(
+            "Probes prepared in {}ms; submitting payload",
+            prep_start.elapsed().as_millis()
+        ));
         let returned = self
             .channel()
             .submit(&submission.payload, Stage::Probes)

@@ -85,6 +85,10 @@ pub(crate) fn timing_exposed(url: &Url, page: &Url, allowed: &str) -> bool {
         })
 }
 
+static LOADER_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<rustc_hash::FxHashMap<(u64, String, Engine), (String, String, RenderSample)>>,
+> = std::sync::OnceLock::new();
+
 impl ApiScript {
     /// Reads the build, route, and stack sample for `engine` from loader `source` fetched at
     /// `url`, using `response` metadata.
@@ -95,16 +99,43 @@ impl ApiScript {
         timeline: &Timeline,
         engine: Engine,
     ) -> Result<Self> {
-        let parsed = ast::parse_javascript("the Turnstile loader", source)?;
-        let mut literals = Literals::default();
-        parsed.script.visit_with(&mut literals);
-        let build = candidates::at_most_one_distinct(literals.builds, "build hash")?
-            .context("loader script has no api.js build hash; is this really api.js?")?;
-        let variant =
-            candidates::at_most_one_distinct(literals.routes, "challenge-platform route")?
-                .context("loader script names no challenge-platform route")?;
-        let render_sample =
-            RenderSample::from_parsed(&parsed, stack_url(&url, &response, engine), engine)?;
+        let cache_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            source.hash(&mut hasher);
+            (
+                hasher.finish(),
+                stack_url(&url, &response, engine).to_string(),
+                engine,
+            )
+        };
+        let cache = LOADER_CACHE
+            .get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
+        let cached = {
+            let guard = cache.read().ok();
+            guard.and_then(|g| g.get(&cache_key).cloned())
+        };
+        let (build, variant, render_sample) = if let Some(hit) = cached {
+            hit
+        } else {
+            let parsed = ast::parse_javascript("the Turnstile loader", source)?;
+            let mut literals = Literals::default();
+            parsed.script.visit_with(&mut literals);
+            let build = candidates::at_most_one_distinct(literals.builds, "build hash")?
+                .context("loader script has no api.js build hash; is this really api.js?")?;
+            let variant =
+                candidates::at_most_one_distinct(literals.routes, "challenge-platform route")?
+                    .context("loader script names no challenge-platform route")?;
+            let render_sample =
+                RenderSample::from_parsed(&parsed, stack_url(&url, &response, engine), engine)?;
+            if let Ok(mut guard) = cache.write() {
+                guard.insert(
+                    cache_key,
+                    (build.clone(), variant.clone(), render_sample.clone()),
+                );
+            }
+            (build, variant, render_sample)
+        };
         Ok(Self {
             url,
             build,

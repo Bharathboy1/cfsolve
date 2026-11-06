@@ -12,7 +12,7 @@ use wreq::{RequestBuilder, Response};
 use zstd::stream;
 
 /// Response measurements: encoded and decoded body sizes and server timing.
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ResponseMetrics {
     pub encoded_bytes: u64,
     pub decoded_bytes: u64,

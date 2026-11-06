@@ -109,6 +109,12 @@ impl Channel<'_> {
         let name = format!("{}payload.json", stage.prefix());
         self.sink.json(&name, &submission.plaintext)?;
         let body = self.encoder.encode(&submission.plaintext);
+        let wait_ms = submission.send_at - crate::performance_clock::epoch_ms();
+        if wait_ms > 0 {
+            self.sink.progress(&format!(
+                "Pacing {stage:?}: waiting {wait_ms}ms until scheduled send_at"
+            ));
+        }
         timing::sleep_until(submission.send_at).await;
         self.post(body, stage).await
     }
@@ -141,11 +147,13 @@ impl Channel<'_> {
         let (body, network) = http::read_encoded(response)
             .await
             .context("reading challenge POST response")?;
+        let read_ms = (timer.elapsed_ms() - waiting_ms).max(0.0).round() as u64;
+        let waiting_ms = waiting_ms.round() as u64;
         sink.json(&format!("{name}-network.json"), &network)?;
-        let fetch = timer.phased(url.as_str(), waiting_ms, network.encoded_bytes);
+        let fetch = timer.phased(url.as_str(), waiting_ms as f64, network.encoded_bytes);
         sink.artifact(&format!("{name}.bin"), &body)?;
         sink.progress(&format!(
-            "POST returned HTTP {status}; saved {} bytes",
+            "POST returned HTTP {status} (TTFB: {waiting_ms}ms, read: {read_ms}ms); saved {} bytes",
             body.len()
         ));
         if !status.is_success() {

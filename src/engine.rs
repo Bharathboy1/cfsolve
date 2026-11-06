@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 /// An engine family, named in lowercase in the fingerprint's `engine`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     /// Blink and V8, used by Chrome and related browsers.
